@@ -18,7 +18,7 @@ from pathlib import Path
 import sys
 
 sys.path.append(str(Path(__file__).resolve().parent))
-from data_loader import load_all_seasons
+from nba_data_loader import load_all_seasons
 
 PROCESSED_DIR = Path(__file__).resolve().parent.parent / "data" / "processed"
 PLAYER_WINDOWS = [5, 10]
@@ -163,6 +163,88 @@ def build_dataset() -> pd.DataFrame:
     print(f"\nTarget (PTS) distribution:\n{dataset['PTS'].describe().round(1)}")
 
     return dataset
+
+
+def get_latest_player_form(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Each player's CURRENT rolling form, as of their most recent played
+    game -- for live prediction (not training). Same idea as the PL
+    project's compute_latest_team_form, applied per player.
+
+    start_rate_last5 uses forward-filled last-known value rather than a
+    fresh rolling calc, since nba_api's bulk endpoint doesn't carry
+    starter/position data (see nba_live_data.py docstring) -- this is a
+    documented simplification, justified by that feature's <2% importance
+    in Phase 4.
+    """
+    df = df.sort_values(["PlayerID", "Date"]).copy()
+    grouped = df.groupby("PlayerID", group_keys=False)
+
+    def roll(col, window, agg="mean"):
+        return grouped[col].rolling(window, min_periods=1).agg(agg).reset_index(level=0, drop=True)
+
+    df["_avg_points_last5"] = roll("PTS", 5)
+    df["_avg_points_last10"] = roll("PTS", 10)
+    df["_avg_minutes_last5"] = roll("Minutes", 5)
+    df["_avg_minutes_last10"] = roll("Minutes", 10)
+    df["_avg_rebounds_last5"] = roll("REB", 5)
+    df["_avg_assists_last5"] = roll("AST", 5)
+    df["_avg_fga_last5"] = roll("FGA", 5)
+    df["_std_points_last10"] = roll("PTS", 10, agg="std")
+
+    df["_start_rate_ffill"] = grouped["IsStarter"].apply(lambda s: s.ffill())
+
+    # Season-to-date average for whichever season is each player's most
+    # recent (mirrors the per-season reset used in training) -- computed
+    # separately since it needs to reset at season boundaries, unlike the
+    # trailing 5/10-game windows above which deliberately don't.
+    current_season_avg = (
+        df.groupby(["PlayerID", "Season"])["PTS"].transform("mean")
+    )
+    df["_season_avg_current"] = current_season_avg
+
+    latest = (
+        df.groupby("PlayerID")
+        .agg(
+            Player=("Player", "last"),
+            Team=("Team", "last"),
+            last_game_date=("Date", "max"),
+            avg_points_last5=("_avg_points_last5", "last"),
+            avg_points_last10=("_avg_points_last10", "last"),
+            avg_minutes_last5=("_avg_minutes_last5", "last"),
+            avg_minutes_last10=("_avg_minutes_last10", "last"),
+            avg_rebounds_last5=("_avg_rebounds_last5", "last"),
+            avg_assists_last5=("_avg_assists_last5", "last"),
+            avg_fga_last5=("_avg_fga_last5", "last"),
+            std_points_last10=("_std_points_last10", "last"),
+            start_rate_last5=("_start_rate_ffill", "last"),
+            season_avg_points_to_date=("_season_avg_current", "last"),
+        )
+    )
+    # Players with NO real starter data anywhere in their history (e.g.
+    # rookies only seen via nba_api) fall back to the league-wide average.
+    latest["start_rate_last5"] = latest["start_rate_last5"].fillna(latest["start_rate_last5"].mean())
+    return latest
+
+
+def get_latest_team_form(team_game: pd.DataFrame, window: int = OPPONENT_WINDOW) -> pd.DataFrame:
+    """Each team's current rolling defensive/pace form, as of their most
+    recent played game -- for live prediction."""
+    team_game = team_game.sort_values(["Team", "Date"]).copy()
+    grouped = team_game.groupby("Team", group_keys=False)
+    team_game["_pts_allowed_roll"] = grouped["PointsAllowed"].rolling(window, min_periods=1) \
+        .mean().reset_index(level=0, drop=True)
+    team_game["_pace_roll"] = grouped["Possessions"].rolling(window, min_periods=1) \
+        .mean().reset_index(level=0, drop=True)
+
+    return (
+        team_game.groupby("Team")
+        .agg(
+            last_game_date=("Date", "max"),
+            points_allowed_last=("_pts_allowed_roll", "last"),
+            pace_last=("_pace_roll", "last"),
+        )
+    )
 
 
 if __name__ == "__main__":
